@@ -1,0 +1,143 @@
+name: CI and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brightlane-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: curl, dom, fileinfo, mbstring, openssl, pdo_sqlite, sqlite3, xml
+          coverage: none
+
+      - name: Prepare CI environment
+        run: |
+          cp .env.example .env
+          mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+          php -r 'touch("database/database.sqlite");'
+
+      - name: Install Composer dependencies
+        run: |
+          if [ -f composer.lock ]; then
+            composer install --prefer-dist --no-interaction --no-progress
+          else
+            # On the first run the ZIP has no lock file; resolve dependencies and deploy
+            # the generated lock file from this same tested workflow run.
+            composer update --prefer-dist --no-interaction --no-progress
+          fi
+
+      - name: Generate CI application key
+        run: php artisan key:generate --force
+
+      - name: Run automated tests
+        run: php artisan test
+
+      - name: Configure SSH for deployment
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_SSH_PRIVATE_KEY" || { echo "Missing DEPLOY_SSH_PRIVATE_KEY secret"; exit 1; }
+          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "Missing DEPLOY_KNOWN_HOSTS secret"; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > "$HOME/.ssh/brightlane_deploy"
+          chmod 600 "$HOME/.ssh/brightlane_deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Verify SSH and destination
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          test -n "$APP_URL" || { echo "Missing APP_URL repository variable"; exit 1; }
+          test -n "$DEPLOY_HOST" || { echo "Missing DEPLOY_HOST secret"; exit 1; }
+          test -n "$DEPLOY_USER" || { echo "Missing DEPLOY_USER secret"; exit 1; }
+          test -n "$DEPLOY_PATH" || { echo "Missing DEPLOY_PATH secret"; exit 1; }
+          ssh -i "$HOME/.ssh/brightlane_deploy" \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "test -d '$DEPLOY_PATH'"
+
+      - name: Upload application files
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          rsync -e "ssh -i $HOME/.ssh/brightlane_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" -rlz --delete \
+            --exclude='.env' \
+            --exclude='vendor/' \
+            --exclude='storage/' \
+            --exclude='bootstrap/cache/*.php' \
+            --exclude='public/storage' \
+            --exclude='database/*.sqlite' \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='tests/' \
+            --exclude='phpunit.xml' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Install production dependencies and optimize Laravel
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_APP_URL: ${{ vars.APP_URL }}
+        run: |
+          ssh -i "$HOME/.ssh/brightlane_deploy" \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' DEPLOY_APP_URL='$DEPLOY_APP_URL' bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+          cd "$DEPLOY_PATH"
+          test -f artisan || { echo "artisan is missing from DEPLOY_PATH"; exit 1; }
+          mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+          if [ ! -f .env ]; then cp .env.example .env; fi
+          composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+          if ! grep -Eq '^APP_KEY=base64:.+' .env; then
+            php artisan key:generate --force
+          fi
+          if [ -n "${DEPLOY_APP_URL:-}" ]; then
+            DEPLOY_APP_URL="$DEPLOY_APP_URL" php -r '
+              $file = ".env";
+              $url = getenv("DEPLOY_APP_URL");
+              $contents = file_get_contents($file);
+              $line = "APP_URL=\"" . str_replace(["\\", "\""], ["\\\\", "\\\""], $url) . "\"";
+              if (preg_match("/^APP_URL=.*/m", $contents)) {
+                  $contents = preg_replace("/^APP_URL=.*/m", $line, $contents, 1);
+              } else {
+                  $contents .= "\n" . $line . "\n";
+              }
+              file_put_contents($file, $contents);
+            '
+          fi
+          chmod 640 .env
+          chmod -R ug+rwX storage bootstrap/cache
+          php artisan optimize:clear
+          php artisan optimize
+          REMOTE
