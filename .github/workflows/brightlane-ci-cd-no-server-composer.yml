@@ -1,0 +1,188 @@
+name: CI and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep production deployments serialized, but let pull-request tests use their own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      COMPOSER_PROCESS_TIMEOUT: 0
+      COMPOSER_NO_INTERACTION: 1
+      COMPOSER_NO_AUDIT: 1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: curl, dom, fileinfo, mbstring, openssl, pdo_sqlite, sqlite3, xml
+          coverage: none
+
+      - name: Prepare CI environment
+        run: |
+          set -euo pipefail
+          test -f composer.json || { echo "composer.json is missing"; exit 1; }
+          test -f .env.example || { echo ".env.example is missing"; exit 1; }
+          cp .env.example .env
+          mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache database
+          php -r 'touch("database/database.sqlite");'
+
+      - name: Install Composer dependencies
+        run: |
+          set -euo pipefail
+          if [ -f composer.lock ]; then
+            composer install --prefer-dist --no-interaction --no-progress
+          else
+            echo "::warning::composer.lock is not committed. Resolving dependencies for this run; commit composer.lock for reproducible deployments."
+            composer update --prefer-dist --no-interaction --no-progress
+          fi
+
+      - name: Generate CI application key
+        run: php artisan key:generate --force
+
+      - name: Run automated tests
+        run: php artisan test
+
+      - name: Configure SSH for deployment
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_PRIVATE_KEY" || { echo "Missing DEPLOY_SSH_PRIVATE_KEY secret"; exit 1; }
+          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "Missing DEPLOY_KNOWN_HOSTS secret"; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' > "$HOME/.ssh/brightlane_deploy"
+          chmod 600 "$HOME/.ssh/brightlane_deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/brightlane_deploy" >/dev/null
+
+      - name: Verify SSH and destination
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_URL" || { echo "Missing APP_URL repository variable"; exit 1; }
+          case "$APP_URL" in
+            https://*) ;;
+            *) echo "APP_URL must begin with https://"; exit 1 ;;
+          esac
+          test -n "$DEPLOY_HOST" || { echo "Missing DEPLOY_HOST secret"; exit 1; }
+          test -n "$DEPLOY_USER" || { echo "Missing DEPLOY_USER secret"; exit 1; }
+          test -n "$DEPLOY_PATH" || { echo "Missing DEPLOY_PATH secret"; exit 1; }
+          test "$DEPLOY_PATH" = "/var/www/brightlane" || {
+            echo "Unsafe DEPLOY_PATH; expected /var/www/brightlane"; exit 1;
+          }
+          ssh -i "$HOME/.ssh/brightlane_deploy" \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'test -d /var/www/brightlane && test -w /var/www/brightlane'
+
+      - name: Upload application files
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOY_PATH" = "/var/www/brightlane" || {
+            echo "Unsafe DEPLOY_PATH; expected /var/www/brightlane"; exit 1;
+          }
+          rsync -e "ssh -i $HOME/.ssh/brightlane_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+            -rlz --delete \
+            --exclude='.env' \
+            --exclude='vendor/' \
+            --exclude='storage/' \
+            --exclude='bootstrap/cache/*.php' \
+            --exclude='public/storage' \
+            --exclude='database/*.sqlite' \
+            --exclude='database/*.sqlite-*' \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='tests/' \
+            --exclude='phpunit.xml' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Configure and optimize Laravel (dependencies preinstalled on server)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_APP_URL: ${{ vars.APP_URL }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOY_PATH" = "/var/www/brightlane" || {
+            echo "Unsafe DEPLOY_PATH; expected /var/www/brightlane"; exit 1;
+          }
+          case "$DEPLOY_APP_URL" in
+            https://*) ;;
+            *) echo "APP_URL must begin with https://"; exit 1 ;;
+          esac
+
+          # Pass validated values as shell-escaped assignments, rather than interpolating
+          # them directly into a remote command string.
+          {
+            printf 'DEPLOY_PATH=%q\n' "$DEPLOY_PATH"
+            printf 'DEPLOY_APP_URL=%q\n' "$DEPLOY_APP_URL"
+            cat <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+          cd "$DEPLOY_PATH"
+          test -f artisan || { echo "artisan is missing from DEPLOY_PATH"; exit 1; }
+          test -f composer.json || { echo "composer.json is missing from DEPLOY_PATH"; exit 1; }
+          mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+          # Dependencies are installed during initial server setup. Verify the autoloader
+          # exists, but do not run Composer on the production server during each deploy.
+          test -f vendor/autoload.php || {
+            echo "Composer dependencies are missing on the server; run composer install --no-dev --optimize-autoloader once during setup.";
+            exit 1;
+          }
+          if ! grep -Eq '^APP_KEY=base64:.+' .env; then
+            php artisan key:generate --force
+          fi
+          DEPLOY_APP_URL="$DEPLOY_APP_URL" php -r '
+            $file = ".env";
+            $url = getenv("DEPLOY_APP_URL");
+            $contents = file_get_contents($file);
+            $line = "APP_URL=\"" . str_replace(["\\", "\""], ["\\\\", "\\\""], $url) . "\"";
+            if (preg_match("/^APP_URL=.*/m", $contents)) {
+                $contents = preg_replace("/^APP_URL=.*/m", $line, $contents, 1);
+            } else {
+                $contents .= "\n" . $line . "\n";
+            }
+            file_put_contents($file, $contents);
+          '
+          chmod 640 .env
+          chmod -R ug+rwX storage bootstrap/cache
+          php artisan optimize:clear
+          php artisan optimize
+          REMOTE_SCRIPT
+          } | ssh -i "$HOME/.ssh/brightlane_deploy" \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s'
